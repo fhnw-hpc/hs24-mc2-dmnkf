@@ -126,6 +126,7 @@ def main():
     block_dims= (bx, by)
 
     # Warm-up
+    # we need to pass the shared memory size to the kernel to avoid shape errors
     kernel[grid_dims, block_dims, 0, shared_mem_bytes](U_dev, S_dev, VT_dev, out_dev, k)
     cuda.synchronize()
 
