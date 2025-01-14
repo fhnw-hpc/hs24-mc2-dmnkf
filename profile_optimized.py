@@ -4,111 +4,113 @@ import numpy as np
 from numba import cuda, float32
 
 
-def get_padded_kernel_dynamic():
-    """
-    Returns a tile-based GPU kernel that:
-      • Uses dynamic shared memory (1D buffer)
-      • Pads tileU and tileV to reduce shared-memory bank conflicts
-      • Manually indexes each element to avoid reshape() issues
-      • Applies small fixes to reduce integer overhead
-    """
+def get_kernel_tiled(BM, BN):
+    
+    BK = int(BM / 2)
+    TM = int(BM / 4)
+    TN = int(BN / 4)
 
-    @cuda.jit(fastmath=True)
-    def tile_svd_kernel_s_padded_dynamic(u, s, vt, C, k, bx, by):
+    print(f"BM: {BM}, BN: {BN}, BK: {BK}, TM: {TM}, TN: {TN}")
+
+    @cuda.jit
+    def svd_reconstruct_tiled(U, S, Vt, out, M, N, K):
         """
-        out[row, col] = sum_{r=0..k-1} (u[row, r] * s[r]) * vt[r, col]
-
-        Shared memory layout (1D array):
-          tileU_size  = by * (bx + 1)
-          tileV_size  = bx * (by + 1)
-          s_tile_size = bx
-          total_size  = tileU_size + tileV_size + s_tile_size
-
-        Offsets:
-          offsetU = 0
-          offsetV = tileU_size
-          offsetS = tileU_size + tileV_size
-
-        Tile Access:
-          tileU[rowU + tx], tileV[colV + ty], etc.
-          where rowU = offsetU + ty*(bx+1), colV = offsetV + tx*(by+1).
-
-        The +1 in bx+1 or by+1 provides padding that helps avoid bank conflicts.
+        estimated time spent making this work dynamically: 8 hours
+        Huge thanks to https://siboehm.com/articles/22/CUDA-MMM
         """
 
-        # 1) Access dynamic shared memory as a 1D float array
-        shared_mem = cuda.shared.array(0, float32)
-
-        # Compute chunk sizes
-        tileU_size = by * (bx + 1)
-        tileV_size = bx * (by + 1)
-
-        offsetU = 0
-        offsetV = tileU_size
-        offsetS = tileU_size + tileV_size
-
-        # Map thread indices to global row/col
-        row = cuda.blockIdx.y * by + cuda.threadIdx.y
-        col = cuda.blockIdx.x * bx + cuda.threadIdx.x
-
-        # Check OOB
-        if row >= C.shape[0] or col >= C.shape[1]:
-            return
-
-        # Single-precision accumulator
-        acc = float32(0.0)
-        tile_count = (k + bx - 1) // bx
-
-        # Thread IDs
+        bx = cuda.blockIdx.x
+        by = cuda.blockIdx.y
         tx = cuda.threadIdx.x
-        ty = cuda.threadIdx.y
+        
+        # This thread is responsible for TM x TN sub-results in the final C
+        # We also define how many threads per block in x-dimension:
+        # if total threads in a block = (BM*BN)/(TM*TN) we can find local row/col
+        # But we'll keep it simpler: each block is BM x BN results, each thread produces TM x TN sub-result
+        # -> we define "threadRow" & "threadCol" in that 2D sub-block:
+        threads_per_block = (BM * BN) // (TM * TN)
+        # safety check or assumption:
+        if threads_per_block != cuda.blockDim.x:
+            return  # mismatch: user must set blockDim.x to threads_per_block
 
-        # Precompute partial offsets to reduce integer overhead inside the loop
-        # For U access
-        rowU_base = offsetU + ty * (bx + 1)
-        # For V access (transposed indexing)
-        colV_base = offsetV + tx * (by + 1)
+        # The row "tile" in the block for this thread:
+        threadRow = tx // (BN // TN)
+        threadCol = tx %  (BN // TN)
 
-        for t in range(tile_count):
-            k_base = t * bx
+        # Output tile base index:
+        row_start = by * BM
+        col_start = bx * BN
 
-            # 1) Load chunk of s[] into shared memory
-            s_idx = k_base + tx
-            if s_idx < k:
-                shared_mem[offsetS + tx] = s[s_idx]
-            else:
-                shared_mem[offsetS + tx] = float32(0.0)
+        # Shared memory for chunk of U, V^T
+        # U-shape: BM x BK, V^T-shape: BK x BN
+        U_shared = cuda.shared.array(shape=(BM, BK), dtype=float32)
+        Vt_shared = cuda.shared.array(shape=(BK, BN), dtype=float32)
+
+        # each thread accumulates TM x TN partial results
+        result = cuda.local.array(shape=(TM, TN), dtype=float32)
+        for r in range(TM):
+            for c in range(TN):
+                result[r, c] = 0.0
+
+
+        # for each block tile in the K dimension
+        for k_tile in range(0, K, BK):
+            # each thread loads some portion of the BM x BK chunk
+            load_x = tx
+            # we'll stride along BM direction in increments of blockDim.x so downward 
+            while load_x < BM:
+                # go through the BK dimension (across the columns) ---> 
+                for kk in range(BK):
+                    real_k = k_tile + kk
+                    if real_k < K and (row_start + load_x) < M:
+                        U_shared[load_x, kk] = U[row_start + load_x, real_k]
+                    else:
+                        U_shared[load_x, kk] = 0.0
+                load_x += threads_per_block
+
+            # load the tile of V^T into Bs
+            load_y = tx
+            # go through the BN dimension (across the columns) of V^T so to the right
+            while load_y < BN:
+                # go through the BK dimension (across the rows) of V^T so to the bottom
+                for kk in range(BK):
+                    real_k = k_tile + kk
+                    if real_k < K and (col_start + load_y) < N:
+                        # we allocate the S tile here as well to save storage
+                        Vt_shared[kk, load_y] = Vt[real_k, col_start + load_y] * S[real_k]
+                    else:
+                        Vt_shared[kk, load_y] = 0.0
+                load_y += threads_per_block
 
             cuda.syncthreads()
 
-            # 2) Load tileU from U[row, s_idx] * s_tile
-            if row < u.shape[0] and s_idx < k:
-                valS = shared_mem[offsetS + tx]
-                shared_mem[rowU_base + tx] = u[row, s_idx] * valS
-            else:
-                shared_mem[rowU_base + tx] = float32(0.0)
-
-            # 3) Load tileV from vt[s_idx2, col]
-            s_idx2 = k_base + ty
-            if s_idx2 < vt.shape[0] and col < vt.shape[1]:
-                shared_mem[colV_base + ty] = vt[s_idx2, col]
-            else:
-                shared_mem[colV_base + ty] = float32(0.0)
-
-            cuda.syncthreads()
-
-            # 4) Dot product across this chunk
-            for n in range(bx):
-                valU = shared_mem[rowU_base + n]
-                valV = shared_mem[colV_base + n]
-                acc += valU * valV
+            # compute partial sums for TM x TN sub-block in registers
+            #  dotIdx is always across bk so inner dim
+            for dotIdx in range(BK):
+                # first row wise 
+                for i in range(TM):
+                    # row in As
+                    rowA = threadRow * TM + i
+                    aVal = U_shared[rowA, dotIdx]
+                    # then col wise
+                    for j in range(TN):
+                        # col in Bs
+                        colB = threadCol * TN + j
+                        # calculate the partial sum for all the rows of that col in Bs within a thread
+                        result[i, j] += aVal * Vt_shared[dotIdx, colB]
 
             cuda.syncthreads()
 
-        # 5) Write the final result to global memory
-        C[row, col] = acc
+        # store results to global memory
+        for i in range(TM):
+            out_row = row_start + (threadRow * TM) + i
+            if out_row < M:
+                for j in range(TN):
+                    out_col = col_start + (threadCol * TN) + j
+                    if out_col < N:
+                        out[out_row, out_col] = result[i, j]
+    return svd_reconstruct_tiled
 
-    return tile_svd_kernel_s_padded_dynamic
 
 
 def main():
@@ -116,8 +118,9 @@ def main():
         description="Tile-based GPU partial SVD-like reconstruction with dynamic shared memory + manual indexing."
     )
     parser.add_argument("--size", type=int, default=2048, help="Matrix dimension N.")
+    # we take the dim based on jupyter notebook best performance
     parser.add_argument("--blockDimX", type=int, default=16, help="Block dimension X.")
-    parser.add_argument("--blockDimY", type=int, default=16, help="Block dimension Y.")
+    parser.add_argument("--blockDimY", type=int, default=64, help="Block dimension Y.")
     parser.add_argument("--rank", type=int, default=512, help="Partial rank k.")
     args = parser.parse_args()
 
@@ -126,60 +129,58 @@ def main():
     by = args.blockDimY
     k = args.rank
 
-    print("\n--- Padded Shared-Memory Tile Kernel (Manual Indexing) ---")
-    print(f"Matrix size: {N} x {N}")
-    print(f"BlockDim  : ({bx}, {by})")
-    print(f"Rank (k)  : {k}")
-    print("-----------------------------------------------------------")
+    if bx < 4 or by < 4:
+        raise ValueError("Block size must be at least 4x4, but should really be much bigger anyway...")
 
-    # 1) Generate random data for U, S, VT
     U_host = np.random.randn(N, N).astype(np.float32)
     S_host = np.random.randn(N).astype(np.float32)
     VT_host = np.random.randn(N, N).astype(np.float32)
 
-    # 2) Transfer data to GPU
-    U_dev = cuda.to_device(U_host)
-    S_dev = cuda.to_device(S_host)
-    VT_dev = cuda.to_device(VT_host)
-    out_dev = cuda.device_array((N, N), dtype=np.float32)
+    u_device = cuda.to_device(U_host)
+    s_device = cuda.to_device(S_host)
+    vt_device = cuda.to_device(VT_host)
+    C_device = cuda.device_array((N, N), dtype=np.float32)
+    
+    M, _ = U_host.shape
+    _, N = VT_host.shape
+    # Tile sizes: BM=16, BN=16 => we want grid = ceil(M/16, N/16) blocks
+    BM = int(bx)
+    BN = int(by)
+    blocks_x = math.ceil(N / BN)
+    blocks_y = math.ceil(M / BM)
+    
+    threads_per_block = (BM * BN) // (BM / 4 * BN / 4)   # = (16*16)/(4*4) = 16
 
-    # 3) Get the kernel
-    kernel = get_padded_kernel_dynamic()
+    print("\n--- Padded Shared-Memory Tile Kernel (Manual Indexing) ---")
+    print(f"Matrix size: {N} x {N}")
+    print(f"BlockDim  : ({bx}, {by})")
+    print(f"Rank (k)  : {k}")
+    print(f"Sub block dims: {BM/4} x {BN/4}")
+    print(f"Threads per block: {threads_per_block}")
+    print("-----------------------------------------------------------")
 
-    # 4) Compute dynamic shared memory usage
-    tileU_size = by * (bx + 1)
-    tileV_size = bx * (by + 1)
-    s_tile_size = bx
-    total_floats = tileU_size + tileV_size + s_tile_size
-    shared_mem_bytes = total_floats * 4  # 4 bytes per float32
 
-    # 5) Grid/block config
-    gridX = math.ceil(N / bx)
-    gridY = math.ceil(N / by)
-    grid_dims = (gridX, gridY)
-    block_dims = (bx, by)
-
-    # 6) Warm-up
-    kernel[grid_dims, block_dims, 0, shared_mem_bytes](
-        U_dev, S_dev, VT_dev, out_dev, k, bx, by
-    )
+    kernel = get_kernel_tiled(BM, BN)
+    grid_dim = (blocks_x, blocks_y)
+    block_dim = (int(threads_per_block),)
+    kernel[grid_dim, block_dim](u_device, s_device, vt_device, C_device, M, N, k)
     cuda.synchronize()
-
-    # 7) Time the kernel with CUDA events
+    
     start_event = cuda.event()
     stop_event = cuda.event()
 
+    # Timed run
     start_event.record()
-    kernel[grid_dims, block_dims, 0, shared_mem_bytes](
-        U_dev, S_dev, VT_dev, out_dev, k, bx, by
-    )
+    kernel[grid_dim, block_dim](u_device, s_device, vt_device, C_device, M, N, k)
     cuda.synchronize()
     stop_event.record()
+    
+    # validate the result
+    C_cpu = np.dot(np.dot(U_host[:N, :k], np.diag(S_host[:k])), VT_host[:k, :N])
+    assert np.allclose(C_device, C_cpu, atol=1e-3), "Result mismatch"
 
     elapsed_ms = cuda.event_elapsed_time(start_event, stop_event)
     print(f"[GPU] Partial reconstruction time: {elapsed_ms / 1000:.5f} s\n")
-
-    print("Done. Re-run with Nsight (nsys/ncu) to see if bank conflicts & linking errors are resolved.\n")
 
 
 if __name__ == "__main__":

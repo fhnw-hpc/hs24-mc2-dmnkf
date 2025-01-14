@@ -141,7 +141,6 @@ def main():
 
     elapsed_ms = cuda.event_elapsed_time(start_event, stop_event)
     print(f"[GPU] Partial reconstruction time: {elapsed_ms/1000:.5f} s\n")
-    print("Now you can run Nsight Compute on this script, and it shouldn't fail on the shape errors.\n")
 
 
 if __name__ == "__main__":
