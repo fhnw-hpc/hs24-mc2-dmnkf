@@ -1,7 +1,3 @@
-# gpu_reconstruction_no_save_demo.py
-# Purpose: Demonstrate GPU concurrency for random images, no disk saving.
-#          We remove all logic that wrote images to "out/".
-
 import math
 import time
 import threading
