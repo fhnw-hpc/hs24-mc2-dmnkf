@@ -15,7 +15,7 @@ def get_kernel_tiled_padded(BM, BN):
 
     print(f"BM={BM}, BN={BN}, BK={BK}, TM={TM}, TN={TN}; Shared arrays have BKpad={BKpad}, BNpad={BNpad}")
 
-    @cuda.jit
+    @cuda.jit(fastmath=True)
     def svd_reconstruct_tiled_padded(U, S, Vt, out, M, N, K):
         bx = cuda.blockIdx.x
         by = cuda.blockIdx.y

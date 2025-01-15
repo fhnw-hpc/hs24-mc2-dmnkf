@@ -13,11 +13,11 @@ from numpy.linalg import svd
 
 # --- Configuration ---
 LOG_LEVEL = logging.INFO
-BLOCK_SIZE_X, BLOCK_SIZE_Y = 16, 16
-TOTAL_IMAGES = 2
-IMG_SIZE = 2**10  # 1024
-NUM_WORKERS = 1   # single CPU worker controlling GPU
-NUM_STREAMS = 16   # concurrency on GPU
+BLOCK_SIZE_X, BLOCK_SIZE_Y = 32, 32
+TOTAL_IMAGES = 10000
+IMG_SIZE = 1024
+NUM_WORKERS = 4
+NUM_STREAMS = 4 
 IMG = np.random.rand(IMG_SIZE, IMG_SIZE).astype(np.float32)
 
 logging.basicConfig(
@@ -27,20 +27,95 @@ logging.basicConfig(
 logging.getLogger("numba.cuda.cudadrv.driver").setLevel(logging.ERROR)
 logger = logging.getLogger(__name__)
 
+BM = int(BLOCK_SIZE_X)
+BN = int(BLOCK_SIZE_Y)
+TM = BM // 8  # => 2
+TN = BN // 8  # => 8
+BK = int(BM / 2)
 
-@cuda.jit
-def gpu_reconstruct_kernel(u, s, vt, out_matrix, k):
-    """
-    GPU kernel: reconstruct the matrix from U, S, and V^T, storing in 'out_matrix'.
-    """
-    y = cuda.blockIdx.x * cuda.blockDim.x + cuda.threadIdx.x
-    x = cuda.blockIdx.y * cuda.blockDim.y + cuda.threadIdx.y
+# Extra columns for padding
+BKpad = BK + 1  # 8 + 1 = 9
+BNpad = BN + 1  # 64 + 1 = 65
 
-    if x < u.shape[0] and y < vt.shape[1]:
-        accum = float32(0.0)
-        for ki in range(k):
-            accum += u[x, ki] * s[ki] * vt[ki, y]
-        out_matrix[x, y] = accum
+@cuda.jit(fastmath=True)
+def svd_reconstruct_tiled_padded(U, S, Vt, out, M, N, K):
+    bx = cuda.blockIdx.x
+    by = cuda.blockIdx.y
+    tx = cuda.threadIdx.x
+
+    threads_per_block = (BM * BN) // (TM * TN)
+    if threads_per_block != cuda.blockDim.x:
+        return
+
+    # 2D sub-block indexing
+    threadRow = tx // (BN // TN)  # => tx // 8
+    threadCol = tx %  (BN // TN)  # => tx % 8
+
+    row_start = by * BM
+    col_start = bx * BN
+
+    # Allocate padded shared arrays:
+    # - We'll store up to [BM, BK], leaving the last col as padding
+    U_shared  = cuda.shared.array((BM, BKpad), dtype=float32)
+    # - We'll store up to [BK, BN], leaving the last col in BN for padding
+    Vt_shared = cuda.shared.array((BK, BNpad), dtype=float32)
+
+    # local accumulation
+    result = cuda.local.array((TM, TN), dtype=float32)
+    for i in range(TM):
+        for j in range(TN):
+            result[i, j] = 0.0
+
+    # Tiling over the K dimension in increments of BK
+    for k_tile in range(0, K, BK):
+        # Load BM rows from U
+        load_x = tx
+        while load_x < BM:
+            for kk in range(BK):
+                real_k = k_tile + kk
+                if real_k < K and (row_start + load_x) < M:
+                    U_shared[load_x, kk] = U[row_start + load_x, real_k]
+                else:
+                    U_shared[load_x, kk] = 0.0
+            # For the padded column
+            U_shared[load_x, BK] = 0.0
+            load_x += threads_per_block
+
+        # Load BN columns from Vt
+        load_y = tx
+        while load_y < BN:
+            for kk in range(BK):
+                real_k = k_tile + kk
+                if real_k < K and (col_start + load_y) < N:
+                    Vt_shared[kk, load_y] = Vt[real_k, col_start + load_y] * S[real_k]
+                else:
+                    Vt_shared[kk, load_y] = 0.0
+            # For the padded column
+            # Actually we have BN+1, so let's null it out:
+            Vt_shared[kk, BN] = 0.0
+            load_y += threads_per_block
+
+        cuda.syncthreads()
+
+        # Dot product
+        for dotIdx in range(BK):
+            for i in range(TM):
+                rowA = threadRow * TM + i
+                aVal = U_shared[rowA, dotIdx]
+                for j in range(TN):
+                    colB = threadCol * TN + j
+                    result[i, j] += aVal * Vt_shared[dotIdx, colB]
+
+        cuda.syncthreads()
+
+    # Store partial results
+    for i in range(TM):
+        out_row = row_start + threadRow*TM + i
+        if out_row < M:
+            for j in range(TN):
+                out_col = col_start + threadCol*TN + j
+                if out_col < N:
+                    out[out_row, out_col] = result[i, j]
 
 
 @dataclass
@@ -137,11 +212,18 @@ class Reconstructor:
                 cuda.to_device(host["S"], to=dev["S"], stream=stream)
                 cuda.to_device(host["V"], to=dev["V"], stream=stream)
 
-                gx = math.ceil(N / BLOCK_SIZE_X)
-                gy = math.ceil(M / BLOCK_SIZE_Y)
-                gpu_reconstruct_kernel[(gy, gx), (BLOCK_SIZE_X, BLOCK_SIZE_Y), stream](
-                    dev["U"], dev["S"], dev["V"], dev["C"], K
-                )
+                M, _ = host["U"].shape
+                _, N = host["V"].shape
+
+                blocks_x = math.ceil(N / BN)
+                blocks_y = math.ceil(M / BM)
+                
+                threads_per_block = (BM * BN) // (BM / 8 * BN / 8)   # = (16*16)/(4) = 4
+
+                grid_dim = (blocks_x, blocks_y)
+                block_dim = (int(threads_per_block),)
+
+                svd_reconstruct_tiled_padded[grid_dim, block_dim, stream](dev["U"], dev["S"], dev["V"], dev["C"], M, N, K)
 
                 dev["C"].copy_to_host(host["C"], stream=stream)
 
@@ -205,17 +287,19 @@ def main():
     if args.sequential:
         # Minimal approach: no concurrency, single stream
         logger.info("Running single-stream, no concurrency approach...")
+        U_host = cuda.pinned_array((M, K), dtype=np.float32)
+        S_host = cuda.pinned_array((K,),   dtype=np.float32)
+        V_host = cuda.pinned_array((K, N), dtype=np.float32)
+        C_host = cuda.pinned_array((M, N), dtype=np.float32)
+        
+        U_host[:] = example_decomp["u"]
+        S_host[:] = example_decomp["s"]
+        V_host[:] = example_decomp["v"]
+
+
         start_t = time.time()
         for i in range(TOTAL_IMAGES):
             # Allocate pinned arrays here (or reuse them)
-            U_host = cuda.pinned_array((M, K), dtype=np.float32)
-            S_host = cuda.pinned_array((K,),   dtype=np.float32)
-            V_host = cuda.pinned_array((K, N), dtype=np.float32)
-            C_host = cuda.pinned_array((M, N), dtype=np.float32)
-
-            U_host[:] = example_decomp["u"]
-            S_host[:] = example_decomp["s"]
-            V_host[:] = example_decomp["v"]
 
             # Copy to device
             U_dev = cuda.to_device(U_host)
@@ -223,9 +307,18 @@ def main():
             V_dev = cuda.to_device(V_host)
             C_dev = cuda.device_array((M, N), dtype=np.float32)
 
-            gx = math.ceil(N / BLOCK_SIZE_X)
-            gy = math.ceil(M / BLOCK_SIZE_Y)
-            gpu_reconstruct_kernel[(gy, gx), (BLOCK_SIZE_X, BLOCK_SIZE_Y)](U_dev, S_dev, V_dev, C_dev, K)
+            M, _ = U_host.shape
+            _, N = V_host.shape
+
+            blocks_x = math.ceil(N / BN)
+            blocks_y = math.ceil(M / BM)
+            
+            threads_per_block = (BM * BN) // (BM / 8 * BN / 8)
+
+            grid_dim = (blocks_x, blocks_y)
+            block_dim = (int(threads_per_block),)
+
+            svd_reconstruct_tiled_padded[grid_dim, block_dim](U_dev, S_dev, V_dev, C_dev, M, N, K)
 
             C_dev.copy_to_host(C_host)
 
